@@ -201,14 +201,20 @@ class XoWebsocketCollector:
             logger.debug("XO raw (unhandled EIO type): %r", raw[:80])
 
     async def _subscribe(self, ws) -> None:
-        """Send a single subscribe event and wait to see what the server accepts."""
-        # Server is "Pulse TWAP Service" — send one subscribe and log all responses
-        msg = f'42["subscribe",{{"marketId":"{self._market_id}"}}]'
-        try:
-            await ws.send(msg)
-            logger.info("XO sent subscribe for market: %s", self._market_id)
-        except Exception as exc:
-            logger.debug("XO subscribe send error: %s", exc)
+        """Subscribe using the exact format observed from XO Market browser client."""
+        subscriptions = [
+            '42["subscribe",{"topic":"adapter.twap","adapterConfigId":2}]',
+            '42["subscribe",{"topic":"adapter.price.tick","adapterConfigId":2}]',
+            f'42["subscribe",{{"topic":"market","marketId":"{self._market_id}"}}]',
+            f'42["subscribe",{{"topic":"orderbook","marketId":"{self._market_id}"}}]',
+        ]
+        for msg in subscriptions:
+            try:
+                await ws.send(msg)
+                logger.info("XO subscribed: %s", msg[30:80])
+            except Exception as exc:
+                logger.debug("XO subscribe send error: %s", exc)
+            await asyncio.sleep(0.1)
 
     async def _handle_sio_message(self, payload: str, recv_ts: int) -> None:
         """Parse 42["event", data] Socket.IO messages."""
@@ -230,17 +236,46 @@ class XoWebsocketCollector:
             _LOGGED_EVENT_TYPES.add(event_name)
             logger.info("XO new event type: %r  sample: %s", event_name, str(data)[:200])
 
-        # Route by event name — covers common naming conventions
-        # Update these once real event names are confirmed from the logs above
         el = event_name.lower()
-        if any(k in el for k in ("quote", "price", "tick", "market")):
+        if event_name == "adapter.price.tick":
+            await self._handle_btc_price_tick(data, recv_ts)
+        elif event_name == "adapter.twap":
+            await self._handle_twap(data, recv_ts)
+        elif any(k in el for k in ("quote", "odds", "market.update", "market_update")):
             await self._handle_quote(data, recv_ts)
         elif any(k in el for k in ("trade", "fill", "match")):
             await self._handle_trade(data, recv_ts)
-        elif any(k in el for k in ("orderbook", "book", "depth", "order_book")):
+        elif any(k in el for k in ("orderbook", "book", "depth")):
             await self._handle_orderbook(data, recv_ts)
         else:
             logger.debug("XO unrouted event: %r", event_name)
+
+    async def _handle_btc_price_tick(self, data: dict, recv_ts: int) -> None:
+        """Handle adapter.price.tick — BTC spot price from Binance via XO TWAP service."""
+        try:
+            price = float(data.get("price", 0))
+            symbol = data.get("symbol", "BTCUSDT")
+            event_ts = int(recv_ts)
+            raw_ts = data.get("timestamp", "")
+            if raw_ts:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                event_ts = int(dt.timestamp() * 1000)
+            latency_ms = recv_ts - event_ts
+            logger.debug("XO BTC price tick: %s=%.2f latency=%dms", symbol, price, latency_ms)
+            await self._event_bus.publish("xo_btc_price", {"price": price, "timestamp_ms": event_ts, "latency_ms": latency_ms})
+            await self._db.insert_latency(timestamp_ms=recv_ts, source="xo_btc_tick", latency_ms=max(0, latency_ms))
+        except Exception as exc:
+            logger.debug("Error processing BTC price tick: %s", exc)
+
+    async def _handle_twap(self, data: dict, recv_ts: int) -> None:
+        """Handle adapter.twap — TWAP price used by XO for market settlement."""
+        try:
+            price = float(data.get("price", data.get("twap", data.get("value", 0))))
+            logger.debug("XO TWAP update: %.2f  raw=%s", price, str(data)[:120])
+            await self._event_bus.publish("xo_twap", {"price": price, "timestamp_ms": recv_ts, "data": data})
+        except Exception as exc:
+            logger.debug("Error processing TWAP: %s", exc)
 
     async def _handle_quote(self, data: dict, recv_ts: int) -> None:
         try:
