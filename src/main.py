@@ -25,6 +25,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Ensure project root is on sys.path so `src.*` imports work whether
+# invoked as `python src/main.py` or `python -m src.main`
+_project_root = str(Path(__file__).resolve().parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 # ─── Safety guard ─────────────────────────────────────────────────────────────
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").strip().lower()
 if LIVE_TRADING == "true":
