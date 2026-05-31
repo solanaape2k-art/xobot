@@ -145,10 +145,9 @@ class Database:
         return self._write_conn
 
     def _get_read_conn(self) -> duckdb.DuckDBPyConnection:
-        """Return a per-thread read connection."""
-        if not hasattr(_thread_local, "conn") or _thread_local.conn is None:
-            _thread_local.conn = duckdb.connect(self.db_path, read_only=False)
-        return _thread_local.conn
+        """Return the single write connection for reads (DuckDB is single-writer).
+        Protected by _write_lock when called from query()."""
+        return self._get_write_conn()
 
     def initialize(self) -> None:
         """Create tables and sequences. Must be called before starting async loop."""
@@ -369,13 +368,14 @@ class Database:
     # -------------------------------------------------------------------------
 
     def query(self, sql: str, params: Optional[List] = None) -> List[Tuple]:
-        """Execute a read query. Uses per-thread connection."""
+        """Execute a read query. Uses the single connection, protected by lock."""
         try:
-            conn = self._get_read_conn()
-            if params:
-                result = conn.execute(sql, params).fetchall()
-            else:
-                result = conn.execute(sql).fetchall()
+            with self._write_lock:
+                conn = self._get_read_conn()
+                if params:
+                    result = conn.execute(sql, params).fetchall()
+                else:
+                    result = conn.execute(sql).fetchall()
             return result
         except Exception as exc:
             logger.error("DB query error: %s", exc)
