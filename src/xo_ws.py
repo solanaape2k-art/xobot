@@ -129,7 +129,7 @@ class XoWebsocketCollector:
 
         async with websockets.connect(
             XO_WS_URL,
-            additional_headers={"Origin": "https://xo.market"},
+            extra_headers={"Origin": "https://xo.market"},
             ping_interval=None,   # we handle pings manually via EIO protocol
             close_timeout=5,
         ) as ws:
