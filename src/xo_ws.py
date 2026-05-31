@@ -1,7 +1,15 @@
 """
-XO Market websocket collector.
-XO Market is a prediction market — exact API format is unknown (TODO: update when docs available).
-Uses configurable XO_WS_URL env var. Fails gracefully if unavailable.
+XO Market websocket collector — Socket.IO over WebSocket.
+
+XO Market uses Socket.IO (EIO=4), which wraps messages in a specific protocol:
+  - "0{...}"   → EIO open handshake (server sends ping interval)
+  - "2"        → EIO ping (server → client)
+  - "3"        → EIO pong (client → server, keep-alive response)
+  - "40"       → Socket.IO connect ACK
+  - "42[event, data]" → Socket.IO message (the data we care about)
+
+We log all raw events on first connect so you can see exact event names and
+payload shapes from the real XO Market API.
 """
 
 from __future__ import annotations
@@ -12,7 +20,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional
 
 import websockets
 from dotenv import load_dotenv
@@ -21,12 +29,18 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-XO_WS_URL = os.getenv("XO_WS_URL", "wss://api.xo.market/ws")
+XO_WS_URL = os.getenv(
+    "XO_WS_URL",
+    "wss://api-mainnet.xo.market/socket.io/?EIO=4&transport=websocket",
+)
 XO_MARKET_ID = os.getenv("XO_MARKET_ID", "BTC-5M-UP")
 
 RECONNECT_BASE_DELAY = 2.0
 RECONNECT_MAX_DELAY = 30.0
 RECONNECT_BACKOFF = 2.0
+
+# Log every unique raw event name once so we can learn the real API shape
+_LOGGED_EVENT_TYPES: set[str] = set()
 
 
 @dataclass
@@ -60,25 +74,9 @@ class XoOrderbookLevel:
 
 
 class XoWebsocketCollector:
-    """
-    Connects to XO Market websocket and collects prediction market data.
+    """Connects to XO Market via Socket.IO WebSocket and collects prediction market data."""
 
-    NOTE: XO Market's exact websocket message format is unknown at time of writing.
-    The code below handles a reasonable predicted format and can be updated when
-    official XO Market API documentation becomes available.
-
-    Message format assumed (TODO: verify with actual XO Market docs):
-      {"type": "quote", "market_id": "BTC-5M-UP", "yes_price": 0.52, "no_price": 0.48, ...}
-      {"type": "trade", "market_id": "BTC-5M-UP", "side": "yes", "price": 0.52, "size": 100}
-      {"type": "orderbook", "market_id": "BTC-5M-UP", "bids": [...], "asks": [...]}
-    """
-
-    def __init__(
-        self,
-        db,
-        event_bus,
-        imbalance_engine,
-    ) -> None:
+    def __init__(self, db, event_bus, imbalance_engine) -> None:
         self._db = db
         self._event_bus = event_bus
         self._imbalance = imbalance_engine
@@ -87,6 +85,8 @@ class XoWebsocketCollector:
         self._last_quote: Optional[XoQuote] = None
         self._messages_recv = 0
         self._market_id = XO_MARKET_ID
+        self._ping_interval: float = 25.0
+        self._ping_task: Optional[asyncio.Task] = None
 
     @property
     def connected(self) -> bool:
@@ -101,7 +101,6 @@ class XoWebsocketCollector:
         return self._messages_recv
 
     async def start(self) -> None:
-        """Start WS collector with reconnect loop. Non-fatal if XO is unavailable."""
         delay = RECONNECT_BASE_DELAY
         while not self._shutdown:
             try:
@@ -111,9 +110,7 @@ class XoWebsocketCollector:
                 break
             except Exception as exc:
                 self._connected = False
-                logger.warning(
-                    "XO WS disconnected/unavailable: %s — retrying in %.1fs", exc, delay
-                )
+                logger.warning("XO WS disconnected: %s — retrying in %.1fs", exc, delay)
                 await self._event_bus.publish("xo_connected", {"connected": False, "error": str(exc)})
                 try:
                     await asyncio.sleep(delay)
@@ -124,74 +121,142 @@ class XoWebsocketCollector:
     async def stop(self) -> None:
         self._shutdown = True
         self._connected = False
+        if self._ping_task:
+            self._ping_task.cancel()
 
     async def _connect(self) -> None:
-        url = XO_WS_URL
-        logger.info("Connecting to XO Market WS: %s", url)
+        logger.info("Connecting to XO Market WS (Socket.IO): %s", XO_WS_URL)
 
         async with websockets.connect(
-            url,
-            ping_interval=20,
-            ping_timeout=10,
+            XO_WS_URL,
+            additional_headers={"Origin": "https://xo.market"},
+            ping_interval=None,   # we handle pings manually via EIO protocol
             close_timeout=5,
         ) as ws:
             self._connected = True
             logger.info("XO WS connected")
             await self._event_bus.publish("xo_connected", {"connected": True})
 
-            # Subscribe to market (format TBD by XO Market docs)
-            subscribe_msg = json.dumps({
-                "action": "subscribe",
-                "market_id": self._market_id,
-                "channels": ["quotes", "trades", "orderbook"],
-            })
-            await ws.send(subscribe_msg)
+            if self._ping_task:
+                self._ping_task.cancel()
+            self._ping_task = asyncio.create_task(self._ping_loop(ws))
 
-            async for raw in ws:
-                if self._shutdown:
-                    break
-                recv_ts = int(time.time() * 1000)
-                try:
-                    msg = json.loads(raw)
-                    await self._handle_message(msg, recv_ts)
-                except Exception as exc:
-                    logger.debug("XO WS parse error: %s", exc)
+            try:
+                async for raw in ws:
+                    if self._shutdown:
+                        break
+                    recv_ts = int(time.time() * 1000)
+                    await self._handle_raw(ws, raw, recv_ts)
+            finally:
+                if self._ping_task:
+                    self._ping_task.cancel()
+                    self._ping_task = None
 
         self._connected = False
 
-    async def _handle_message(self, msg: dict, recv_ts: int) -> None:
-        """
-        Route incoming messages by type.
-        TODO: Update message parsing once XO Market API docs are available.
-        """
-        msg_type = msg.get("type", "")
-        market_id = msg.get("market_id", self._market_id)
+    async def _ping_loop(self, ws) -> None:
+        """Respond to EIO server pings and send keep-alive pongs."""
+        while True:
+            await asyncio.sleep(self._ping_interval)
+            try:
+                await ws.send("3")  # EIO pong
+            except Exception:
+                break
+
+    async def _handle_raw(self, ws, raw: str, recv_ts: int) -> None:
+        """Parse Socket.IO / Engine.IO framing then dispatch."""
+        if not raw:
+            return
+
+        # EIO packet type is the first character(s)
+        if raw.startswith("0"):
+            # EIO open — contains server config JSON
+            try:
+                config = json.loads(raw[1:])
+                self._ping_interval = config.get("pingInterval", 25000) / 1000
+                logger.info("XO EIO handshake: pingInterval=%.1fs", self._ping_interval)
+            except Exception:
+                pass
+            # Socket.IO connect
+            await ws.send("40")
+            # Subscribe to market data after SIO connect
+            await self._subscribe(ws)
+
+        elif raw == "2":
+            # EIO ping from server — reply with pong
+            await ws.send("3")
+
+        elif raw.startswith("40"):
+            # Socket.IO connect ACK — connection is fully ready
+            logger.info("XO Socket.IO connected, subscribing to %s", self._market_id)
+            await self._subscribe(ws)
+
+        elif raw.startswith("42"):
+            # Socket.IO message: 42["event_name", {...}]
+            await self._handle_sio_message(raw[2:], recv_ts)
+
+        elif raw.startswith("43"):
+            # Socket.IO ACK response — ignore
+            pass
+
+        else:
+            logger.debug("XO raw (unhandled EIO type): %r", raw[:80])
+
+    async def _subscribe(self, ws) -> None:
+        """Emit Socket.IO subscription events for market data."""
+        # Emit a join/subscribe event — log exact event names once we see server responses
+        for event in ["subscribe", "join", "market:subscribe"]:
+            msg = f'42["{event}",{{"market_id":"{self._market_id}","channels":["quotes","trades","orderbook"]}}]'
+            try:
+                await ws.send(msg)
+            except Exception:
+                pass
+
+    async def _handle_sio_message(self, payload: str, recv_ts: int) -> None:
+        """Parse 42["event", data] Socket.IO messages."""
+        try:
+            parsed = json.loads(payload)
+        except Exception:
+            logger.debug("XO SIO parse error: %r", payload[:120])
+            return
+
+        if not isinstance(parsed, list) or len(parsed) < 2:
+            return
+
+        event_name: str = parsed[0]
+        data = parsed[1] if len(parsed) > 1 else {}
         self._messages_recv += 1
 
-        if msg_type == "quote":
-            await self._handle_quote(msg, market_id, recv_ts)
-        elif msg_type == "trade":
-            await self._handle_trade(msg, market_id, recv_ts)
-        elif msg_type == "orderbook":
-            await self._handle_orderbook(msg, market_id, recv_ts)
-        elif msg_type == "market_status":
-            await self._handle_market_status(msg, market_id, recv_ts)
-        else:
-            logger.debug("Unknown XO message type: %s", msg_type)
+        # Log every new event type once so we learn the real API shape
+        if event_name not in _LOGGED_EVENT_TYPES:
+            _LOGGED_EVENT_TYPES.add(event_name)
+            logger.info("XO new event type: %r  sample: %s", event_name, str(data)[:200])
 
-    async def _handle_quote(self, msg: dict, market_id: str, recv_ts: int) -> None:
+        # Route by event name — covers common naming conventions
+        # Update these once real event names are confirmed from the logs above
+        el = event_name.lower()
+        if any(k in el for k in ("quote", "price", "tick", "market")):
+            await self._handle_quote(data, recv_ts)
+        elif any(k in el for k in ("trade", "fill", "match")):
+            await self._handle_trade(data, recv_ts)
+        elif any(k in el for k in ("orderbook", "book", "depth", "order_book")):
+            await self._handle_orderbook(data, recv_ts)
+        else:
+            logger.debug("XO unrouted event: %r", event_name)
+
+    async def _handle_quote(self, data: dict, recv_ts: int) -> None:
         try:
-            event_ts = int(msg.get("timestamp", recv_ts))
-            yes_price = float(msg.get("yes_price", 0.5))
-            no_price = float(msg.get("no_price", 0.5))
-            volume = float(msg.get("volume", 0.0))
-            status = msg.get("status", "active")
+            event_ts = int(data.get("timestamp", data.get("ts", recv_ts)))
+            yes_price = float(data.get("yes_price", data.get("yesPrice", data.get("yes", 0.5))))
+            no_price = float(data.get("no_price", data.get("noPrice", data.get("no", 0.5))))
+            volume = float(data.get("volume", data.get("vol", 0.0)))
+            status = str(data.get("status", "active"))
             spread = abs(yes_price - no_price)
-            latency_ms = recv_ts - event_ts
+            latency_ms = recv_ts - event_ts if event_ts <= recv_ts else 0.0
 
             quote = XoQuote(
                 timestamp_ms=event_ts,
-                market_id=market_id,
+                market_id=self._market_id,
                 yes_price=yes_price,
                 no_price=no_price,
                 spread=spread,
@@ -203,86 +268,71 @@ class XoWebsocketCollector:
 
             await self._db.insert_xo_quote(
                 timestamp_ms=event_ts,
-                market_id=market_id,
+                market_id=self._market_id,
                 yes_price=yes_price,
                 no_price=no_price,
                 spread=spread,
                 volume=volume,
                 status=status,
             )
-
             if latency_ms >= 0:
                 await self._db.insert_latency(
                     timestamp_ms=recv_ts,
                     source="xo_quote",
                     latency_ms=latency_ms,
                 )
-
             await self._event_bus.publish("xo_quote", quote)
 
         except Exception as exc:
             logger.debug("Error processing XO quote: %s", exc)
 
-    async def _handle_trade(self, msg: dict, market_id: str, recv_ts: int) -> None:
+    async def _handle_trade(self, data: dict, recv_ts: int) -> None:
         try:
-            event_ts = int(msg.get("timestamp", recv_ts))
-            side = msg.get("side", "unknown")
-            price = float(msg.get("price", 0.0))
-            size = float(msg.get("size", 0.0))
+            event_ts = int(data.get("timestamp", data.get("ts", recv_ts)))
+            side = str(data.get("side", data.get("outcome", "unknown")))
+            price = float(data.get("price", 0.0))
+            size = float(data.get("size", data.get("amount", 0.0)))
 
             trade = XoTrade(
                 timestamp_ms=event_ts,
-                market_id=market_id,
+                market_id=self._market_id,
                 side=side,
                 price=price,
                 size=size,
             )
-
             await self._db.insert_xo_trade(
                 timestamp_ms=event_ts,
-                market_id=market_id,
+                market_id=self._market_id,
                 side=side,
                 price=price,
                 size=size,
             )
-
             await self._event_bus.publish("xo_trade", trade)
 
         except Exception as exc:
             logger.debug("Error processing XO trade: %s", exc)
 
-    async def _handle_orderbook(self, msg: dict, market_id: str, recv_ts: int) -> None:
-        """
-        Handle orderbook update.
-        Expected format (TODO: verify):
-          {
-            "type": "orderbook",
-            "market_id": "BTC-5M-UP",
-            "yes_bids": [{"price": 0.52, "size": 100}, ...],
-            "yes_asks": [{"price": 0.54, "size": 200}, ...],
-            "no_bids": [{"price": 0.46, "size": 150}, ...],
-            "no_asks": [{"price": 0.48, "size": 80}, ...],
-          }
-        """
+    async def _handle_orderbook(self, data: dict, recv_ts: int) -> None:
         try:
-            event_ts = int(msg.get("timestamp", recv_ts))
             from src.imbalance import OrderbookLevel
+            event_ts = int(data.get("timestamp", data.get("ts", recv_ts)))
 
             levels = []
             for side_key, side_name in [
-                ("yes_bids", "yes_bid"),
-                ("yes_asks", "yes_ask"),
-                ("no_bids", "no_bid"),
-                ("no_asks", "no_ask"),
+                ("yes_bids", "yes_bid"), ("yes_asks", "yes_ask"),
+                ("no_bids", "no_bid"),   ("no_asks", "no_ask"),
+                # alternate naming
+                ("yesBids", "yes_bid"),  ("yesAsks", "yes_ask"),
+                ("noBids", "no_bid"),    ("noAsks", "no_ask"),
             ]:
-                for entry in msg.get(side_key, []):
-                    price = float(entry.get("price", 0))
-                    size = float(entry.get("size", 0))
+                for entry in data.get(side_key, []):
+                    price = float(entry.get("price", entry.get("p", 0)))
+                    size = float(entry.get("size", entry.get("s", entry.get("amount", 0))))
                     if price > 0:
                         levels.append(OrderbookLevel(price=price, size=size, side=side_name))
                         await self._db.insert_xo_orderbook(
                             timestamp_ms=event_ts,
-                            market_id=market_id,
+                            market_id=self._market_id,
                             side=side_name,
                             price=price,
                             size=size,
@@ -295,8 +345,3 @@ class XoWebsocketCollector:
 
         except Exception as exc:
             logger.debug("Error processing XO orderbook: %s", exc)
-
-    async def _handle_market_status(self, msg: dict, market_id: str, recv_ts: int) -> None:
-        status = msg.get("status", "unknown")
-        logger.info("XO Market status: %s -> %s", market_id, status)
-        await self._event_bus.publish("xo_market_status", {"market_id": market_id, "status": status})
