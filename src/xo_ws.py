@@ -177,17 +177,15 @@ class XoWebsocketCollector:
                 logger.info("XO EIO handshake: pingInterval=%.1fs", self._ping_interval)
             except Exception:
                 pass
-            # Socket.IO connect
+            # Send Socket.IO connect packet
             await ws.send("40")
-            # Subscribe to market data after SIO connect
-            await self._subscribe(ws)
 
         elif raw == "2":
             # EIO ping from server — reply with pong
             await ws.send("3")
 
         elif raw.startswith("40"):
-            # Socket.IO connect ACK — connection is fully ready
+            # Socket.IO connect ACK — connection is fully ready, now subscribe once
             logger.info("XO Socket.IO connected, subscribing to %s", self._market_id)
             await self._subscribe(ws)
 
@@ -203,14 +201,14 @@ class XoWebsocketCollector:
             logger.debug("XO raw (unhandled EIO type): %r", raw[:80])
 
     async def _subscribe(self, ws) -> None:
-        """Emit Socket.IO subscription events for market data."""
-        # Emit a join/subscribe event — log exact event names once we see server responses
-        for event in ["subscribe", "join", "market:subscribe"]:
-            msg = f'42["{event}",{{"market_id":"{self._market_id}","channels":["quotes","trades","orderbook"]}}]'
-            try:
-                await ws.send(msg)
-            except Exception:
-                pass
+        """Send a single subscribe event and wait to see what the server accepts."""
+        # Server is "Pulse TWAP Service" — send one subscribe and log all responses
+        msg = f'42["subscribe",{{"marketId":"{self._market_id}"}}]'
+        try:
+            await ws.send(msg)
+            logger.info("XO sent subscribe for market: %s", self._market_id)
+        except Exception as exc:
+            logger.debug("XO subscribe send error: %s", exc)
 
     async def _handle_sio_message(self, payload: str, recv_ts: int) -> None:
         """Parse 42["event", data] Socket.IO messages."""
