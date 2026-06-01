@@ -101,6 +101,14 @@ class XoWebsocketCollector:
         return self._messages_recv
 
     async def start(self) -> None:
+        # Run WS collector and REST poller concurrently
+        await asyncio.gather(
+            self._ws_loop(),
+            self._rest_poll_loop(),
+            return_exceptions=True,
+        )
+
+    async def _ws_loop(self) -> None:
         delay = RECONNECT_BASE_DELAY
         while not self._shutdown:
             try:
@@ -117,6 +125,100 @@ class XoWebsocketCollector:
                 except asyncio.CancelledError:
                     break
                 delay = min(delay * RECONNECT_BACKOFF, RECONNECT_MAX_DELAY)
+
+    async def _rest_poll_loop(self) -> None:
+        """Poll XO REST API every 2s for market odds as fallback to WS market events."""
+        import aiohttp
+        base = "https://api-mainnet.xo.market"
+        # Try common REST endpoint patterns
+        endpoints = [
+            f"/markets/{self._market_id}",
+            f"/api/markets/{self._market_id}",
+            f"/v1/markets/{self._market_id}",
+            f"/api/v1/markets/{self._market_id}",
+        ]
+        working_endpoint: Optional[str] = None
+        logged_fail = False
+
+        async with aiohttp.ClientSession(headers={"Origin": "https://xo.market"}) as session:
+            while not self._shutdown:
+                try:
+                    if working_endpoint:
+                        urls = [base + working_endpoint]
+                    else:
+                        urls = [base + ep for ep in endpoints]
+
+                    for url in urls:
+                        try:
+                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    if working_endpoint is None:
+                                        working_endpoint = url.replace(base, "")
+                                        logger.info("XO REST market endpoint found: %s", working_endpoint)
+                                    recv_ts = int(time.time() * 1000)
+                                    await self._handle_rest_market(data, recv_ts)
+                                    break
+                        except Exception:
+                            continue
+                    else:
+                        if not logged_fail and not working_endpoint:
+                            logger.debug("XO REST: no working market endpoint found yet")
+                            logged_fail = True
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    logger.debug("XO REST poll error: %s", exc)
+
+                try:
+                    await asyncio.sleep(2.0)
+                except asyncio.CancelledError:
+                    break
+
+    async def _handle_rest_market(self, data: dict, recv_ts: int) -> None:
+        """Parse REST market response for YES/NO prices."""
+        try:
+            # Log structure once to learn field names
+            if "rest_market" not in _LOGGED_EVENT_TYPES:
+                _LOGGED_EVENT_TYPES.add("rest_market")
+                logger.info("XO REST market structure: %s", str(data)[:300])
+
+            yes_price = float(
+                data.get("yesPrice", data.get("yes_price", data.get("yesProbability",
+                data.get("yes", data.get("oddYes", 0.5)))))
+            )
+            no_price = float(
+                data.get("noPrice", data.get("no_price", data.get("noProbability",
+                data.get("no", data.get("oddNo", 1 - yes_price)))))
+            )
+            volume = float(data.get("volume", data.get("totalVolume", 0)))
+            status = str(data.get("status", data.get("state", "active")))
+            spread = abs(yes_price - no_price)
+
+            quote = XoQuote(
+                timestamp_ms=recv_ts,
+                market_id=self._market_id,
+                yes_price=yes_price,
+                no_price=no_price,
+                spread=spread,
+                volume=volume,
+                status=status,
+                latency_ms=0,
+            )
+            self._last_quote = quote
+            await self._db.insert_xo_quote(
+                timestamp_ms=recv_ts,
+                market_id=self._market_id,
+                yes_price=yes_price,
+                no_price=no_price,
+                spread=spread,
+                volume=volume,
+                status=status,
+            )
+            await self._event_bus.publish("xo_quote", quote)
+        except Exception as exc:
+            logger.debug("XO REST market parse error: %s", exc)
 
     async def stop(self) -> None:
         self._shutdown = True
@@ -206,15 +308,20 @@ class XoWebsocketCollector:
             '42["subscribe",{"topic":"adapter.twap","adapterConfigId":2}]',
             '42["subscribe",{"topic":"adapter.price.tick","adapterConfigId":2}]',
             f'42["subscribe",{{"topic":"market","marketId":"{self._market_id}"}}]',
+            f'42["subscribe",{{"topic":"market.odds","marketId":"{self._market_id}"}}]',
+            f'42["subscribe",{{"topic":"market.update","marketId":"{self._market_id}"}}]',
             f'42["subscribe",{{"topic":"orderbook","marketId":"{self._market_id}"}}]',
+            f'42["subscribe",{{"topic":"trades","marketId":"{self._market_id}"}}]',
+            '42["subscribe",{"topic":"markets"}]',
+            '42["subscribe",{"topic":"market.list"}]',
         ]
         for msg in subscriptions:
             try:
                 await ws.send(msg)
-                logger.info("XO subscribed: %s", msg[30:80])
+                logger.debug("XO subscribed: %s", msg[30:90])
             except Exception as exc:
                 logger.debug("XO subscribe send error: %s", exc)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
 
     async def _handle_sio_message(self, payload: str, recv_ts: int) -> None:
         """Parse 42["event", data] Socket.IO messages."""
