@@ -157,7 +157,7 @@ class XoWebsocketCollector:
                                 # Log detail structure once
                                 if "pulse_market_detail" not in _LOGGED_EVENT_TYPES:
                                     _LOGGED_EVENT_TYPES.add("pulse_market_detail")
-                                    logger.info("XO pulse detail structure: %s", str(detail)[:500])
+                                    logger.info("XO pulse detail structure: %s", str(detail)[:2000])
                                 await self._handle_pulse_market(detail, recv_ts)
 
                 except asyncio.CancelledError:
@@ -175,7 +175,7 @@ class XoWebsocketCollector:
         try:
             if "pulse_market" not in _LOGGED_EVENT_TYPES:
                 _LOGGED_EVENT_TYPES.add("pulse_market")
-                logger.info("XO pulse market structure: %s", str(market)[:400])
+                logger.info("XO pulse market structure: %s", str(market)[:2000])
 
             status = str(market.get("status", "active"))
             opening_price = float(market.get("openingPrice") or 0)
