@@ -87,6 +87,7 @@ class XoWebsocketCollector:
         self._market_id = XO_MARKET_ID
         self._ping_interval: float = 25.0
         self._ping_task: Optional[asyncio.Task] = None
+        self._last_btc_price: float = 0.0
 
     @property
     def connected(self) -> bool:
@@ -181,16 +182,28 @@ class XoWebsocketCollector:
             opening_price = float(market.get("openingPrice") or 0)
             outcomes = market.get("outcomes", [])
 
-            # outcomes[0]=UP(YES), outcomes[1]=DOWN(NO)
-            # currentPrice is in basis points (divide by 1_000_000)
+            # Try to get prices from outcomes first
             up_raw = next((o for o in outcomes if o.get("title", "").upper() == "UP"), None)
             down_raw = next((o for o in outcomes if o.get("title", "").upper() == "DOWN"), None)
-
             if up_raw is None and len(outcomes) >= 2:
                 up_raw, down_raw = outcomes[0], outcomes[1]
 
-            yes_price = float(up_raw.get("currentPrice", 500000)) / 1_000_000 if up_raw else 0.5
-            no_price = float(down_raw.get("currentPrice", 500000)) / 1_000_000 if down_raw else 0.5
+            if up_raw and float(up_raw.get("currentPrice", 0)) > 0:
+                # Real prices from API
+                yes_price = float(up_raw["currentPrice"]) / 1_000_000
+                no_price = float(down_raw["currentPrice"]) / 1_000_000 if down_raw else 1 - yes_price
+            elif opening_price > 0 and self._last_btc_price > 0:
+                # Derive implied probability from BTC vs opening price
+                # Simple linear: 1% BTC move = ~10% probability shift
+                btc_change_pct = (self._last_btc_price - opening_price) / opening_price * 100
+                yes_price = max(0.05, min(0.95, 0.5 + btc_change_pct * 0.10))
+                no_price = 1.0 - yes_price
+                logger.debug("XO implied: BTC=%.2f open=%.2f chg=%.3f%% UP=%.3f DOWN=%.3f",
+                            self._last_btc_price, opening_price, btc_change_pct, yes_price, no_price)
+            else:
+                yes_price = 0.5
+                no_price = 0.5
+
             volume = float(up_raw.get("volumeTradedInUSD", 0) if up_raw else 0) + \
                      float(down_raw.get("volumeTradedInUSD", 0) if down_raw else 0)
             spread = abs(yes_price - no_price)
@@ -364,6 +377,7 @@ class XoWebsocketCollector:
         """Handle adapter.price.tick — BTC spot price from Binance via XO TWAP service."""
         try:
             price = float(data.get("price", 0))
+            self._last_btc_price = price
             symbol = data.get("symbol", "BTCUSDT")
             event_ts = int(recv_ts)
             raw_ts = data.get("timestamp", "")
