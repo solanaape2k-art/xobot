@@ -164,7 +164,60 @@ class StrategyEngine:
             spread_condition=conditions_met[3],
         )
 
-    def _calc_confidence(
+    def evaluate_momentum_always(
+        self,
+        timestamp_ms: int,
+        btc_momentum_5s: float,
+        btc_momentum_30s: float,
+        yes_price: float,
+        no_price: float,
+        market_id: str,
+    ) -> Signal:
+        """
+        Trade every 5-minute window based purely on BTC momentum direction.
+        UP if momentum positive, DOWN if negative, skip only if flat.
+        """
+        momentum_threshold, _, _ = _load_thresholds()
+        current_spread = abs(yes_price - no_price)
+        self.update_spread(current_spread)
+        spread_compression = current_spread / self.rolling_mean_spread if self.rolling_mean_spread > 0 else 1.0
+
+        # Use 30s momentum as primary, 5s as confirmation
+        combined = (btc_momentum_30s * 0.6) + (btc_momentum_5s * 0.4)
+
+        if combined > momentum_threshold * 0.5:
+            signal_type = SignalType.LONG_YES
+            confidence = min(1.0, abs(combined) / (momentum_threshold * 3))
+        elif combined < -momentum_threshold * 0.5:
+            signal_type = SignalType.LONG_NO
+            confidence = min(1.0, abs(combined) / (momentum_threshold * 3))
+        else:
+            signal_type = SignalType.NO_TRADE
+            confidence = 0.0
+
+        if signal_type != SignalType.NO_TRADE:
+            logger.info(
+                "MomentumAlways: %s | momentum_30s=%.4f | momentum_5s=%.4f | combined=%.4f",
+                signal_type.value, btc_momentum_30s, btc_momentum_5s, combined,
+            )
+
+        return Signal(
+            timestamp_ms=timestamp_ms,
+            signal_type=signal_type,
+            confidence=confidence,
+            btc_momentum_5s=btc_momentum_5s,
+            imbalance_score=0.0,
+            spread_compression=spread_compression,
+            volume_spike=False,
+            entry_price=yes_price if signal_type == SignalType.LONG_YES else no_price,
+            market_id=market_id,
+            momentum_condition=signal_type != SignalType.NO_TRADE,
+            imbalance_condition=True,
+            volume_condition=True,
+            spread_condition=True,
+        )
+
+
         self,
         momentum: float,
         imbalance: float,

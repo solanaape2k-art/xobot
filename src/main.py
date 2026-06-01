@@ -267,16 +267,27 @@ class XOBot:
                 yes_price = last_xo.yes_price if last_xo else 0.5
                 no_price = last_xo.no_price if last_xo else 0.5
                 xo_spread = last_xo.spread if last_xo else 0.0
+                strategy_mode = os.getenv("STRATEGY_MODE", "4condition").lower()
 
-                signal = strategy_engine.evaluate(
-                    timestamp_ms=tick.timestamp_ms,
-                    btc_momentum_5s=tick.momentum_5s,
-                    imbalance_score=imb_snap.net_imbalance,
-                    volume_spike=ind_snap.volume_spike,
-                    current_spread=xo_spread,
-                    yes_price=yes_price,
-                    market_id=market_id,
-                )
+                if strategy_mode == "momentum_always":
+                    signal = strategy_engine.evaluate_momentum_always(
+                        timestamp_ms=tick.timestamp_ms,
+                        btc_momentum_5s=tick.momentum_5s,
+                        btc_momentum_30s=tick.momentum_30s,
+                        yes_price=yes_price,
+                        no_price=no_price,
+                        market_id=market_id,
+                    )
+                else:
+                    signal = strategy_engine.evaluate(
+                        timestamp_ms=tick.timestamp_ms,
+                        btc_momentum_5s=tick.momentum_5s,
+                        imbalance_score=imb_snap.net_imbalance,
+                        volume_spike=ind_snap.volume_spike,
+                        current_spread=xo_spread,
+                        yes_price=yes_price,
+                        market_id=market_id,
+                    )
 
                 # Update signal state
                 dashboard_module.update_state("signal", {
