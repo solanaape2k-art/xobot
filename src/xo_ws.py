@@ -127,45 +127,26 @@ class XoWebsocketCollector:
                 delay = min(delay * RECONNECT_BACKOFF, RECONNECT_MAX_DELAY)
 
     async def _rest_poll_loop(self) -> None:
-        """Poll XO REST API every 2s for market odds as fallback to WS market events."""
+        """Poll XO pulse markets API every 2s for active BTC 5-min market prices."""
         import aiohttp
-        base = "https://api-mainnet.xo.market"
-        # Try common REST endpoint patterns
-        endpoints = [
-            f"/markets/{self._market_id}",
-            f"/api/markets/{self._market_id}",
-            f"/v1/markets/{self._market_id}",
-            f"/api/v1/markets/{self._market_id}",
-        ]
-        working_endpoint: Optional[str] = None
-        logged_fail = False
+        # Confirmed endpoint from browser network inspection
+        url = "https://api-mainnet.xo.market/api/pulse/markets?status=active&marketConfigId=2&adapterConfigId=2&limit=1&sortBy=closedAt&sortOrder=DESC"
+        headers = {"Origin": "https://beta.xo.market", "Referer": "https://beta.xo.market/"}
 
-        async with aiohttp.ClientSession(headers={"Origin": "https://xo.market"}) as session:
+        async with aiohttp.ClientSession(headers=headers) as session:
             while not self._shutdown:
                 try:
-                    if working_endpoint:
-                        urls = [base + working_endpoint]
-                    else:
-                        urls = [base + ep for ep in endpoints]
-
-                    for url in urls:
-                        try:
-                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
-                                if resp.status == 200:
-                                    data = await resp.json()
-                                    if working_endpoint is None:
-                                        working_endpoint = url.replace(base, "")
-                                        logger.info("XO REST market endpoint found: %s", working_endpoint)
-                                    recv_ts = int(time.time() * 1000)
-                                    await self._handle_rest_market(data, recv_ts)
-                                    break
-                        except Exception:
-                            continue
-                    else:
-                        if not logged_fail and not working_endpoint:
-                            logger.debug("XO REST: no working market endpoint found yet")
-                            logged_fail = True
-
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                        if resp.status == 200:
+                            body = await resp.json()
+                            recv_ts = int(time.time() * 1000)
+                            markets = body.get("data", [])
+                            if markets:
+                                await self._handle_pulse_market(markets[0], recv_ts)
+                        elif resp.status == 401:
+                            logger.debug("XO REST: auth required, skipping")
+                        else:
+                            logger.debug("XO REST: status %d", resp.status)
                 except asyncio.CancelledError:
                     break
                 except Exception as exc:
@@ -176,29 +157,38 @@ class XoWebsocketCollector:
                 except asyncio.CancelledError:
                     break
 
-    async def _handle_rest_market(self, data: dict, recv_ts: int) -> None:
-        """Parse REST market response for YES/NO prices."""
+    async def _handle_pulse_market(self, market: dict, recv_ts: int) -> None:
+        """Parse a pulse market record into YES(UP)/NO(DOWN) prices."""
         try:
-            # Log structure once to learn field names
-            if "rest_market" not in _LOGGED_EVENT_TYPES:
-                _LOGGED_EVENT_TYPES.add("rest_market")
-                logger.info("XO REST market structure: %s", str(data)[:300])
+            if "pulse_market" not in _LOGGED_EVENT_TYPES:
+                _LOGGED_EVENT_TYPES.add("pulse_market")
+                logger.info("XO pulse market structure: %s", str(market)[:400])
 
-            yes_price = float(
-                data.get("yesPrice", data.get("yes_price", data.get("yesProbability",
-                data.get("yes", data.get("oddYes", 0.5)))))
-            )
-            no_price = float(
-                data.get("noPrice", data.get("no_price", data.get("noProbability",
-                data.get("no", data.get("oddNo", 1 - yes_price)))))
-            )
-            volume = float(data.get("volume", data.get("totalVolume", 0)))
-            status = str(data.get("status", data.get("state", "active")))
+            status = str(market.get("status", "active"))
+            opening_price = float(market.get("openingPrice") or 0)
+            outcomes = market.get("outcomes", [])
+
+            # outcomes[0]=UP(YES), outcomes[1]=DOWN(NO)
+            # currentPrice is in basis points (divide by 1_000_000)
+            up_raw = next((o for o in outcomes if o.get("title", "").upper() == "UP"), None)
+            down_raw = next((o for o in outcomes if o.get("title", "").upper() == "DOWN"), None)
+
+            if up_raw is None and len(outcomes) >= 2:
+                up_raw, down_raw = outcomes[0], outcomes[1]
+
+            yes_price = float(up_raw.get("currentPrice", 500000)) / 1_000_000 if up_raw else 0.5
+            no_price = float(down_raw.get("currentPrice", 500000)) / 1_000_000 if down_raw else 0.5
+            volume = float(up_raw.get("volumeTradedInUSD", 0) if up_raw else 0) + \
+                     float(down_raw.get("volumeTradedInUSD", 0) if down_raw else 0)
             spread = abs(yes_price - no_price)
+            market_id = str(market.get("id", self._market_id))
+
+            logger.debug("XO pulse: UP=%.3f DOWN=%.3f spread=%.3f vol=$%.0f status=%s",
+                        yes_price, no_price, spread, volume, status)
 
             quote = XoQuote(
                 timestamp_ms=recv_ts,
-                market_id=self._market_id,
+                market_id=market_id,
                 yes_price=yes_price,
                 no_price=no_price,
                 spread=spread,
@@ -209,7 +199,7 @@ class XoWebsocketCollector:
             self._last_quote = quote
             await self._db.insert_xo_quote(
                 timestamp_ms=recv_ts,
-                market_id=self._market_id,
+                market_id=market_id,
                 yes_price=yes_price,
                 no_price=no_price,
                 spread=spread,
@@ -218,7 +208,7 @@ class XoWebsocketCollector:
             )
             await self._event_bus.publish("xo_quote", quote)
         except Exception as exc:
-            logger.debug("XO REST market parse error: %s", exc)
+            logger.debug("XO pulse market parse error: %s", exc)
 
     async def stop(self) -> None:
         self._shutdown = True
