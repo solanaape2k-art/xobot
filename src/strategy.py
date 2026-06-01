@@ -217,7 +217,7 @@ class StrategyEngine:
             spread_condition=True,
         )
 
-
+    def _calc_confidence(
         self,
         momentum: float,
         imbalance: float,
