@@ -129,24 +129,37 @@ class XoWebsocketCollector:
     async def _rest_poll_loop(self) -> None:
         """Poll XO pulse markets API every 2s for active BTC 5-min market prices."""
         import aiohttp
-        # Confirmed endpoint from browser network inspection
-        url = "https://api-mainnet.xo.market/api/pulse/markets?status=active&marketConfigId=2&adapterConfigId=2&limit=1&sortBy=closedAt&sortOrder=DESC"
+        # Fetch active pulse market with outcomes included
+        list_url = "https://api-mainnet.xo.market/api/pulse/markets?status=active&marketConfigId=2&adapterConfigId=2&limit=1&sortBy=startsAt&sortOrder=DESC"
         headers = {"Origin": "https://beta.xo.market", "Referer": "https://beta.xo.market/"}
+        current_market_id: Optional[int] = None
 
         async with aiohttp.ClientSession(headers=headers) as session:
             while not self._shutdown:
                 try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    # Step 1: get active market ID
+                    async with session.get(list_url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
                         if resp.status == 200:
                             body = await resp.json()
-                            recv_ts = int(time.time() * 1000)
                             markets = body.get("data", [])
                             if markets:
+                                current_market_id = markets[0].get("id")
+                                recv_ts = int(time.time() * 1000)
                                 await self._handle_pulse_market(markets[0], recv_ts)
-                        elif resp.status == 401:
-                            logger.debug("XO REST: auth required, skipping")
-                        else:
-                            logger.debug("XO REST: status %d", resp.status)
+
+                    # Step 2: fetch full market detail with outcomes if we have an ID
+                    if current_market_id:
+                        detail_url = f"https://api-mainnet.xo.market/api/pulse/markets/{current_market_id}"
+                        async with session.get(detail_url, timeout=aiohttp.ClientTimeout(total=3)) as resp2:
+                            if resp2.status == 200:
+                                detail = await resp2.json()
+                                recv_ts = int(time.time() * 1000)
+                                # Log detail structure once
+                                if "pulse_market_detail" not in _LOGGED_EVENT_TYPES:
+                                    _LOGGED_EVENT_TYPES.add("pulse_market_detail")
+                                    logger.info("XO pulse detail structure: %s", str(detail)[:500])
+                                await self._handle_pulse_market(detail, recv_ts)
+
                 except asyncio.CancelledError:
                     break
                 except Exception as exc:
