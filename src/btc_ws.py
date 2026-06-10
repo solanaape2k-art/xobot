@@ -126,12 +126,19 @@ class BtcWebsocketCollector:
         return self._messages_recv
 
     async def start(self) -> None:
-        """Start the websocket collector with reconnect loop."""
+        """Start the websocket collector with reconnect loop plus XO-price fallback."""
+        await asyncio.gather(
+            self._binance_loop(),
+            self._xo_price_fallback_loop(),
+            return_exceptions=True,
+        )
+
+    async def _binance_loop(self) -> None:
         delay = RECONNECT_BASE_DELAY
         while not self._shutdown:
             try:
                 await self._connect()
-                delay = RECONNECT_BASE_DELAY  # reset on success
+                delay = RECONNECT_BASE_DELAY
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -144,6 +151,68 @@ class BtcWebsocketCollector:
                 except asyncio.CancelledError:
                     break
                 delay = min(delay * RECONNECT_BACKOFF, RECONNECT_MAX_DELAY)
+
+    async def _xo_price_fallback_loop(self) -> None:
+        """When Binance is unavailable, synthesize BTC ticks from XO's adapter.price.tick feed."""
+        xo_price_q = self._event_bus.subscribe("xo_btc_price")
+        while not self._shutdown:
+            try:
+                msg = await asyncio.wait_for(xo_price_q.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+            if self._connected:
+                # Binance is live — don't duplicate
+                continue
+
+            try:
+                price = float(msg["price"])
+                ts_ms = int(msg["timestamp_ms"])
+                if price <= 0:
+                    continue
+
+                self._last_price = price
+                self._momentum.add(ts_ms, price)
+                momentums = self._momentum.all_momentums()
+
+                tick = BtcTick(
+                    timestamp_ms=ts_ms,
+                    price=price,
+                    bid=price,
+                    ask=price,
+                    spread=0.0,
+                    volume=0.0,
+                    trade_side="xo_feed",
+                    momentum_1s=momentums[1],
+                    momentum_3s=momentums[3],
+                    momentum_5s=momentums[5],
+                    momentum_15s=momentums[15],
+                    momentum_30s=momentums[30],
+                    latency_ms=msg.get("latency_ms", 0),
+                )
+                self._last_tick = tick
+                self._messages_recv += 1
+
+                await self._db.insert_btc_tick(
+                    timestamp_ms=tick.timestamp_ms,
+                    price=tick.price,
+                    bid=tick.bid,
+                    ask=tick.ask,
+                    spread=tick.spread,
+                    volume=tick.volume,
+                    trade_side=tick.trade_side,
+                    momentum_1s=tick.momentum_1s,
+                    momentum_3s=tick.momentum_3s,
+                    momentum_5s=tick.momentum_5s,
+                    momentum_15s=tick.momentum_15s,
+                    momentum_30s=tick.momentum_30s,
+                )
+                await self._event_bus.publish("btc_tick", tick)
+
+            except Exception as exc:
+                logger.debug("XO price fallback error: %s", exc)
 
     async def stop(self) -> None:
         self._shutdown = True
